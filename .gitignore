@@ -4,6 +4,7 @@
 !.env.example
 
 # Python
+*.pkl
 __pycache__/
 *.py[cod]
 .venv/
@@ -30,3 +31,7 @@ backups/
 Thumbs.db
 .idea/
 .vscode/
+
+# 打包產物與本機測試資料庫
+*.egg-info/
+*.sqlite

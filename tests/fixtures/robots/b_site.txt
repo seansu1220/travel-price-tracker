@@ -1,0 +1,7 @@
+# 錄製自虛構的 B 級測試站
+User-agent: *
+Disallow: /account/
+Disallow: /search/private
+
+User-agent: BadBot
+Disallow: /
