@@ -110,3 +110,10 @@ def test_searchable_adapter_cannot_claim_tier_c(gate):
 
     with pytest.raises(TypeError):
         Sneaky(gate)
+
+
+def test_gitignore_excludes_secrets_and_artifacts():
+    patterns = (ROOT / ".gitignore").read_text(encoding="utf-8").split()
+    for required in (".env", "*.pkl", "__pycache__/"):
+        assert required in patterns
+    assert "*.pyc" in patterns or "*.py[cod]" in patterns

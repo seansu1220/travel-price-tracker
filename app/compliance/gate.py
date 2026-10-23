@@ -11,6 +11,8 @@ from datetime import datetime
 
 import httpx
 from redis import Redis
+from redis.exceptions import RedisError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.clock import Clock, as_utc, utcnow
@@ -20,7 +22,9 @@ from app.compliance.budget import BudgetGuard
 from app.compliance.detection import detect_block
 from app.compliance.errors import (
     ComplianceError,
+    FetchFailed,
     GateMisconfigured,
+    GateUnavailable,
     SourceBlocked,
     SourceDisabled,
     SourceNotRegistered,
@@ -35,8 +39,6 @@ from app.compliance.registry import pause_source, review_is_current
 from app.compliance.robots import RobotsChecker, RobotsFetchResult
 from app.config import Settings, get_settings
 from app.models import Source
-
-ALERT_DEDUPE_SECONDS = 86400
 
 
 @dataclass(frozen=True)
@@ -83,8 +85,9 @@ class ComplianceGate:
 
     @property
     def user_agent(self) -> str:
-        s = self._settings
-        return f"{s.crawler_service_name}/{s.app_version} (+mailto:{s.crawler_contact_email.strip()})"
+        settings = self._settings
+        contact = settings.crawler_contact_email.strip()
+        return f"{settings.crawler_service_name}/{settings.app_version} (+mailto:{contact})"
 
     # ---- 對外介面 ----
 
@@ -98,16 +101,16 @@ class ComplianceGate:
         headers: dict | None = None,
         json: object | None = None,
     ) -> httpx.Response:
-        """經過全部檢查後送出請求。被拒絕時丟出 ComplianceError 的子類別。"""
+        """經過全部檢查後送出請求。被拒絕或連線失敗時丟出 ComplianceError 的子類別，絕不重試。"""
         full_url = str(httpx.URL(url, params=params)) if params else url
         permit = self.authorize(source_id, full_url, method)
-        safe_headers = {k: v for k, v in (headers or {}).items() if k.lower() != "user-agent"}
+        safe_headers = {name: value for name, value in (headers or {}).items() if name.lower() != "user-agent"}
         started = time.monotonic()
         try:
             response = self._client.request(method, full_url, headers=safe_headers, json=json)
         except httpx.HTTPError as exc:
             self._log(permit, "error:network", duration_ms=_elapsed_ms(started), detail=repr(exc))
-            raise
+            raise FetchFailed(f"對來源 {source_id} 的請求連線失敗（{method} {full_url}）：{exc!r}") from exc
         self.report(
             permit,
             response.status_code,
@@ -120,15 +123,25 @@ class ComplianceGate:
     def authorize(self, source_id: str, url: str, method: str = "GET") -> Permit:
         method = method.upper()
         robots_verdict = "not_checked"
+        step = "載入來源登錄表"
         try:
-            source = self._load_source(source_id)
-            host = self._check_url(source, url)
-            if source.tier == "B":
-                robots_verdict = self._robots_verdict(source, url)
-            else:
-                robots_verdict = "not_applicable"  # A 級依合約授權，不適用 robots.txt
-            self._limiter.acquire(host, source.min_interval_seconds)
-            self._budget.reserve(source)
+            try:
+                source = self._load_source(source_id)
+                step = "檢查網址範圍"
+                host = self._check_url(source, url)
+                step = "檢查 robots.txt"
+                if source.tier == "B":
+                    robots_verdict = self._robots_verdict(source, url)
+                else:
+                    robots_verdict = "not_applicable"  # A 級依合約授權，不適用 robots.txt
+                step = "限速器"
+                self._limiter.acquire(host, source.min_interval_seconds)
+                step = "預算熔斷"
+                self._budget.reserve(source)
+            except (RedisError, SQLAlchemyError) as exc:
+                raise GateUnavailable(
+                    f"合規閘門在「{step}」步驟無法存取 Redis 或資料庫，已拒絕放行（來源 {source_id}）：{exc}"
+                ) from exc
         except ComplianceError as exc:
             if isinstance(exc, RobotsDisallowed):
                 robots_verdict = exc.verdict
@@ -158,18 +171,33 @@ class ComplianceGate:
         if block_reason is None:
             self._log(permit, "allowed", status_code=status_code, duration_ms=duration_ms)
             return
+        # 先暫停、再告警、最後寫日誌：任何一步失敗都不能讓來源繼續被請求而沒人知道
+        pause_error = self._pause(permit, block_reason)
+        if pause_error is None:
+            self._alerter.send(
+                "critical",
+                f"來源 {permit.source_id} 已暫停",
+                f"收到 {block_reason}，網址 {permit.url}。已停止請求，請人工複審後再恢復。",
+            )
+        else:
+            self._alerter.send(
+                "critical",
+                f"來源 {permit.source_id} 被封鎖但暫停失敗",
+                f"收到 {block_reason}，網址 {permit.url}；寫入暫停狀態失敗：{pause_error}。請立即人工停用此來源。",
+            )
         self._log(permit, f"blocked:{block_reason}", status_code=status_code, duration_ms=duration_ms)
-        with self._session_factory.begin() as session:
-            pause_source(session, permit.source_id, f"{block_reason}（{permit.url}）", self._clock())
-        self._alerter.send(
-            "critical",
-            f"來源 {permit.source_id} 已暫停",
-            f"收到 {block_reason}，網址 {permit.url}。已停止請求，請人工複審後再恢復。",
-        )
         raise SourceBlocked(f"{permit.source_id} 回應 {block_reason}，已暫停")
 
     def close(self) -> None:
         self._client.close()
+
+    def _pause(self, permit: Permit, block_reason: str) -> SQLAlchemyError | None:
+        try:
+            with self._session_factory.begin() as session:
+                pause_source(session, permit.source_id, f"{block_reason}（{permit.url}）", self._clock())
+        except SQLAlchemyError as exc:
+            return exc
+        return None
 
     # ---- 內部檢查 ----
 
@@ -221,6 +249,7 @@ class ComplianceGate:
             self._redis,
             lambda robots_url: self._fetch_robots(source.id, robots_url),
             self._settings.robots_cache_ttl_seconds,
+            self._settings.robots_unavailable_retry_seconds,
         )
         verdict = checker.verdict(url, self._settings.crawler_service_name)
         if verdict != "allowed":
@@ -265,7 +294,7 @@ class ComplianceGate:
         )
 
     def _alert_once(self, dedupe_key: str, level: str, title: str, detail: str) -> None:
-        if self._redis.set(f"alert:{dedupe_key}", "1", nx=True, ex=ALERT_DEDUPE_SECONDS):
+        if self._redis.set(f"alert:{dedupe_key}", "1", nx=True, ex=self._settings.alert_dedupe_seconds):
             self._alerter.send(level, title, detail)
 
 

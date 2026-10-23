@@ -36,10 +36,10 @@ def test_registration_rejects_incomplete_or_invalid_data(overrides):
 
 @pytest.mark.parametrize("missing", ["tier", "terms_url", "reviewed_at", "reviewer"])
 def test_required_fields(missing):
-    data = registration().model_dump()
-    del data[missing]
+    fields = registration().model_dump()
+    del fields[missing]
     with pytest.raises(ValidationError):
-        type(registration())(**data)
+        type(registration())(**fields)
 
 
 def test_b_tier_defaults_follow_spec():
@@ -79,3 +79,17 @@ def test_reregistering_keeps_pause_and_resume_requires_reviewer(session_factory)
     with session_factory() as session:
         source = session.get(Source, "b-site")
         assert source.paused_at is None and source.reviewed_at == date(2026, 10, 23)
+
+
+def test_limit_defaults_come_from_settings(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setenv("SOURCE_DEFAULT_MIN_INTERVAL_SECONDS", "30")
+    monkeypatch.setenv("SOURCE_DEFAULT_DAILY_CALL_LIMIT", "120")
+    get_settings.cache_clear()
+    try:
+        fields = registration().model_dump(exclude={"min_interval_seconds", "daily_call_limit"})
+        reg = type(registration())(**fields)
+        assert (reg.min_interval_seconds, reg.daily_call_limit) == (30, 120)
+    finally:
+        get_settings.cache_clear()

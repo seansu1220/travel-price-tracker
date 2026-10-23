@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.orm import Session
 
 from app.clock import utcnow
+from app.config import get_settings
 from app.models import Source
 
 _ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
@@ -25,9 +26,11 @@ class SourceRegistration(BaseModel):
     reviewer: str = Field(min_length=1)
     allowed_hosts: list[str] = Field(default_factory=list)
     allowed_paths: list[str] = Field(default_factory=list)
-    # SPEC 第六章 B 級預設：每網域每 10 秒最多 1 次、每日最多 500 次
-    min_interval_seconds: int = Field(default=10, ge=1)
-    daily_call_limit: int = Field(default=500, ge=1)
+    # 未填時採設定檔預設值（SOURCE_DEFAULT_MIN_INTERVAL_SECONDS、SOURCE_DEFAULT_DAILY_CALL_LIMIT）
+    min_interval_seconds: int = Field(
+        default_factory=lambda: get_settings().source_default_min_interval_seconds, ge=1
+    )
+    daily_call_limit: int = Field(default_factory=lambda: get_settings().source_default_daily_call_limit, ge=1)
     cost_per_call_minor: int = Field(default=0, ge=0)
     monthly_budget_minor: int = Field(default=0, ge=0)
     budget_currency: str = Field(default="USD", pattern=r"^[A-Z]{3}$")

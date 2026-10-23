@@ -104,7 +104,7 @@ def gate(session_factory, redis, settings, alerter, clock, http):
 
 
 def registration(**overrides) -> SourceRegistration:
-    data = dict(
+    fields = dict(
         id="b-site",
         name="測試 B 級網站",
         kind="flight",
@@ -117,8 +117,8 @@ def registration(**overrides) -> SourceRegistration:
         min_interval_seconds=10,
         daily_call_limit=500,
     )
-    data.update(overrides)
-    return SourceRegistration(**data)
+    fields.update(overrides)
+    return SourceRegistration(**fields)
 
 
 @pytest.fixture

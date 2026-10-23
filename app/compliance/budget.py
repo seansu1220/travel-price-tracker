@@ -1,6 +1,6 @@
 """預算熔斷：每個來源每日呼叫上限、每月金額上限。
 
-達告警門檻（預設 80%）發告警；達 100% 拒絕後續請求並告警（降頻由 P1 排程器處理）。
+達告警門檻（預設 80%）發告警，排程器依此把頻率減半（P1 實作）；達 100% 拒絕後續請求並告警。
 """
 
 from math import ceil
@@ -11,11 +11,17 @@ from app.clock import Clock
 from app.compliance.errors import BudgetExceeded
 from app.models import Source
 
+# Redis 計數器的保存期限：只要撐過計數週期即可，屬技術參數而非業務規則
+DAY_COUNTER_TTL_SECONDS = 2 * 86400
+MONTH_COUNTER_TTL_SECONDS = 40 * 86400
+
 # 回傳 {狀態, 今日次數, 本月花費}；狀態 0=放行、1=超過每日次數、2=超過每月金額
 _RESERVE = """
 local daily_limit = tonumber(ARGV[1])
 local cost = tonumber(ARGV[2])
 local budget = tonumber(ARGV[3])
+local day_ttl = tonumber(ARGV[4])
+local month_ttl = tonumber(ARGV[5])
 local calls = tonumber(redis.call('GET', KEYS[1]) or '0')
 local spent = tonumber(redis.call('GET', KEYS[2]) or '0')
 if calls + 1 > daily_limit then
@@ -25,9 +31,9 @@ if budget > 0 and spent + cost > budget then
   return {2, calls, spent}
 end
 calls = redis.call('INCR', KEYS[1])
-redis.call('EXPIRE', KEYS[1], 172800)
+redis.call('EXPIRE', KEYS[1], day_ttl)
 spent = redis.call('INCRBY', KEYS[2], cost)
-redis.call('EXPIRE', KEYS[2], 3456000)
+redis.call('EXPIRE', KEYS[2], month_ttl)
 return {0, calls, spent}
 """
 
@@ -49,7 +55,13 @@ class BudgetGuard:
             int(v)
             for v in self._script(
                 keys=[day_key, month_key],
-                args=[source.daily_call_limit, source.cost_per_call_minor, source.monthly_budget_minor],
+                args=[
+                    source.daily_call_limit,
+                    source.cost_per_call_minor,
+                    source.monthly_budget_minor,
+                    DAY_COUNTER_TTL_SECONDS,
+                    MONTH_COUNTER_TTL_SECONDS,
+                ],
             )
         )
         if status == 1:

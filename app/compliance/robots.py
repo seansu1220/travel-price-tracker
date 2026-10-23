@@ -4,7 +4,7 @@
 - 2xx：依內容判定
 - 401、403：視為全部禁止
 - 其他 4xx（如 404）：視為沒有限制
-- 3xx、5xx、連線錯誤：視為無法確認，一律不放行（快取 1 小時後再試）
+- 3xx、5xx、連線錯誤：視為無法確認，一律不放行（ROBOTS_UNAVAILABLE_RETRY_SECONDS 後再試）
 """
 
 import json
@@ -14,8 +14,6 @@ from urllib.robotparser import RobotFileParser
 
 import httpx
 from redis import Redis
-
-UNAVAILABLE_CACHE_SECONDS = 3600
 
 
 @dataclass(frozen=True)
@@ -35,10 +33,13 @@ def robots_url_for(url: str) -> str:
 
 
 class RobotsChecker:
-    def __init__(self, redis: Redis, fetcher: RobotsFetcher, ttl_seconds: int) -> None:
+    def __init__(
+        self, redis: Redis, fetcher: RobotsFetcher, ttl_seconds: int, unavailable_retry_seconds: int
+    ) -> None:
         self._redis = redis
         self._fetcher = fetcher
         self._ttl = ttl_seconds
+        self._unavailable_retry = unavailable_retry_seconds
 
     def verdict(self, url: str, user_agent: str) -> str:
         """回傳 allowed / disallowed / unavailable。"""
@@ -73,4 +74,4 @@ class RobotsChecker:
             return {"mode": "deny_all"}, self._ttl
         if status is not None and 400 <= status < 500:
             return {"mode": "allow_all"}, self._ttl
-        return {"mode": "unavailable"}, min(self._ttl, UNAVAILABLE_CACHE_SECONDS)
+        return {"mode": "unavailable"}, min(self._ttl, self._unavailable_retry)

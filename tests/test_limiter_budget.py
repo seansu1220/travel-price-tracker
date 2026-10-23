@@ -30,10 +30,10 @@ def test_rejected_attempt_does_not_reset_the_window(redis, clock):
     limiter.acquire("a.example.com", 10)
 
 
-def _source(**kw) -> Source:
-    data = dict(id="s", daily_call_limit=10, cost_per_call_minor=0, monthly_budget_minor=0, budget_currency="USD")
-    data.update(kw)
-    return Source(**data)
+def _source(**overrides) -> Source:
+    fields = dict(id="s", daily_call_limit=10, cost_per_call_minor=0, monthly_budget_minor=0, budget_currency="USD")
+    fields.update(overrides)
+    return Source(**fields)
 
 
 def test_budget_month_rolls_over(redis, clock):

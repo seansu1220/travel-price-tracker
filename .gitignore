@@ -4,6 +4,7 @@
 !.env.example
 
 # Python
+*.pkl
 __pycache__/
 *.py[cod]
 .venv/

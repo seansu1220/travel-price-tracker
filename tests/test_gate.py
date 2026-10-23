@@ -275,7 +275,7 @@ def test_network_error_is_logged_and_not_retried(gate, http, add_source, session
     add_source()
     http.get(ROBOTS_URL).mock(return_value=httpx.Response(404))
     page = http.get(FARES_URL).mock(side_effect=httpx.ReadTimeout("slow"))
-    with pytest.raises(httpx.ReadTimeout):
+    with pytest.raises(errors.FetchFailed, match="b-site"):
         gate.request("b-site", "GET", FARES_URL)
     assert page.call_count == 1
     assert logs(session_factory)[-1].decision == "error:network"
@@ -351,3 +351,91 @@ def test_browser_flow_authorize_then_report(gate, http, add_source, session_fact
         gate.report(permit, 200, content_type="text/html", body_text=fixture_text("pages/captcha.html"))
     with pytest.raises(errors.SourcePaused):
         gate.authorize("b-site", FARES_URL)
+
+
+# ---- robots.txt 請求：寫入稽核日誌，但不計入限速與預算（擁有者 2026-10-23 決定） ----
+
+
+def test_robots_fetch_is_audited_but_not_counted(gate, http, add_source, clock, redis, session_factory):
+    add_source(daily_call_limit=1, min_interval_seconds=10)
+    robots, page = mock_b_site(http)
+    # 每日上限 1 次、間隔 10 秒：若 robots 請求有被計入，主請求會被擋下
+    gate.request("b-site", "GET", FARES_URL)
+    assert robots.call_count == 1 and page.call_count == 1
+    assert int(redis.get(f"budget:calls:b-site:{clock():%Y%m%d}")) == 1
+
+    robots_log, page_log = logs(session_factory)
+    assert (robots_log.source_id, robots_log.url, robots_log.method) == ("b-site", ROBOTS_URL, "GET")
+    assert (robots_log.decision, robots_log.status_code, robots_log.cost_minor) == ("robots_fetch", 200, 0)
+    assert robots_log.duration_ms is not None
+    assert page_log.decision == "allowed"
+
+
+@pytest.mark.parametrize("status", [404, 403, 500])
+def test_robots_fetch_is_audited_for_every_status(gate, http, add_source, session_factory, status):
+    add_source()
+    mock_b_site(http, robots_status=status, robots_body="")
+    try:
+        gate.request("b-site", "GET", FARES_URL)
+    except errors.RobotsDisallowed:
+        pass
+    robots_log = logs(session_factory)[0]
+    assert (robots_log.url, robots_log.decision, robots_log.status_code) == (ROBOTS_URL, "robots_fetch", status)
+
+
+def test_cached_robots_is_not_fetched_or_logged_again(gate, http, add_source, clock, session_factory):
+    add_source()
+    mock_b_site(http)
+    gate.request("b-site", "GET", FARES_URL)
+    clock.advance(seconds=10)
+    gate.request("b-site", "GET", FARES_URL)
+    assert [log.decision for log in logs(session_factory)] == ["robots_fetch", "allowed", "allowed"]
+
+
+# ---- 依賴服務故障：一律拒絕放行，錯誤訊息標明步驟 ----
+
+
+def test_redis_outage_denies_with_location(session_factory, settings, alerter, clock, http, add_source):
+    import fakeredis
+
+    add_source()
+    server = fakeredis.FakeServer()
+    server.connected = False
+    gate = ComplianceGate(
+        session_factory=session_factory, redis=fakeredis.FakeRedis(server=server),
+        settings=settings, alerter=alerter, clock=clock,
+    )
+    route = http.route().mock(return_value=httpx.Response(200))
+    with pytest.raises(errors.GateUnavailable, match="檢查 robots.txt"):
+        gate.request("b-site", "GET", FARES_URL)
+    assert not route.called
+    assert logs(session_factory)[-1].decision == "denied:gate_unavailable"
+    gate.close()
+
+
+def test_pause_failure_still_alerts_and_stops(gate, http, add_source, alerter, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+
+    add_source()
+    mock_b_site(http, page_status=429, page_body="slow down")
+
+    def broken_pause(*args, **kwargs):
+        raise OperationalError("UPDATE sources", {}, Exception("db down"))
+
+    monkeypatch.setattr("app.compliance.gate.pause_source", broken_pause)
+    with pytest.raises(errors.SourceBlocked):
+        gate.request("b-site", "GET", FARES_URL)
+    level, title, detail = alerter.alerts[-1]
+    assert (level, title) == ("critical", "來源 b-site 被封鎖但暫停失敗")
+    assert "請立即人工停用" in detail
+
+
+def test_audit_write_failure_is_reported_with_context(gate, http, session_factory):
+    from app.models import FetchLog as FetchLogModel
+
+    FetchLogModel.__table__.drop(session_factory.kw["bind"])
+    try:
+        with pytest.raises(errors.AuditWriteError, match="fetch_logs.*unknown"):
+            gate.request("unknown", "GET", FARES_URL)
+    finally:
+        FetchLogModel.__table__.create(session_factory.kw["bind"])

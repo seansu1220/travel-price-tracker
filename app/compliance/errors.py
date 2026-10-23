@@ -12,6 +12,22 @@ class GateMisconfigured(ComplianceError):
     code = "gate_misconfigured"
 
 
+class GateUnavailable(ComplianceError):
+    """閘門依賴的 Redis 或資料庫無法存取：一律拒絕放行（寧可不查，也不要跳過檢查）。"""
+
+    code = "gate_unavailable"
+
+
+class AuditWriteError(ComplianceError):
+    code = "audit_write_failed"
+
+
+class FetchFailed(ComplianceError):
+    """請求已送出但連線失敗（逾時、斷線）。閘門不重試，由排程器下次再排。"""
+
+    code = "fetch_failed"
+
+
 class SourceNotRegistered(ComplianceError):
     code = "source_not_registered"
 

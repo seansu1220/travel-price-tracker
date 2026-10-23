@@ -3,8 +3,10 @@
 from datetime import datetime, timedelta
 
 from sqlalchemy import delete
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.compliance.errors import AuditWriteError
 from app.models import FetchLog
 
 
@@ -26,22 +28,26 @@ class AuditLogger:
         cost_minor: int = 0,
         detail: str | None = None,
     ) -> None:
+        entry = FetchLog(
+            source_id=source_id,
+            method=method,
+            url=url,
+            decision=decision,
+            robots_verdict=robots_verdict,
+            status_code=status_code,
+            duration_ms=duration_ms,
+            cost_minor=cost_minor,
+            detail=detail,
+            created_at=created_at,
+        )
         # 用獨立交易寫入，呼叫端失敗也不會讓稽核紀錄消失
-        with self._session_factory.begin() as session:
-            session.add(
-                FetchLog(
-                    source_id=source_id,
-                    method=method,
-                    url=url,
-                    decision=decision,
-                    robots_verdict=robots_verdict,
-                    status_code=status_code,
-                    duration_ms=duration_ms,
-                    cost_minor=cost_minor,
-                    detail=detail,
-                    created_at=created_at,
-                )
-            )
+        try:
+            with self._session_factory.begin() as session:
+                session.add(entry)
+        except SQLAlchemyError as exc:
+            raise AuditWriteError(
+                f"稽核日誌寫入失敗（fetch_logs，來源 {source_id}，判定 {decision}，網址 {url}）：{exc}"
+            ) from exc
 
 
 def purge_expired_logs(session: Session, now: datetime, retention_days: int) -> int:
