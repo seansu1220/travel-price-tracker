@@ -30,3 +30,7 @@ backups/
 Thumbs.db
 .idea/
 .vscode/
+
+# 打包產物與本機測試資料庫
+*.egg-info/
+*.sqlite
