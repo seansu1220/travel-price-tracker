@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     robots_cache_ttl_seconds: int = 86400
     # robots.txt 無法確認（轉址、5xx、連線失敗）時，多久後再試
     robots_unavailable_retry_seconds: int = 3600
+    # 抓 robots.txt 時最多跟隨幾次轉址（RFC 9309 建議至少 5 次）
+    robots_max_redirects: int = 5
     # 同一事件的告警，在此秒數內只發一次
     alert_dedupe_seconds: int = 86400
     budget_alert_percent: int = 80

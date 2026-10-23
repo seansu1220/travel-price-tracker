@@ -4,7 +4,9 @@
 - 2xx：依內容判定
 - 401、403：視為全部禁止
 - 其他 4xx（如 404）：視為沒有限制
-- 3xx、5xx、連線錯誤：視為無法確認，一律不放行（ROBOTS_UNAVAILABLE_RETRY_SECONDS 後再試）
+- 3xx 轉址：依 RFC 9309 跟隨，最多 ROBOTS_MAX_REDIRECTS 次（預設 5），且只限原網域或其子網域；
+  轉到其他網域或超過次數，視為無法確認
+- 5xx、連線錯誤：視為無法確認，一律不放行（ROBOTS_UNAVAILABLE_RETRY_SECONDS 後再試）
 """
 
 import json
@@ -30,6 +32,15 @@ def robots_url_for(url: str) -> str:
     parsed = httpx.URL(url)
     port = f":{parsed.port}" if parsed.port else ""
     return f"{parsed.scheme}://{parsed.host}{port}/robots.txt"
+
+
+def robots_redirect_allowed(origin_host: str, target: httpx.URL) -> bool:
+    """robots.txt 轉址目標是否可跟隨：只限 http(s)，且為原網域本身或其子網域。"""
+    if target.scheme not in ("http", "https"):
+        return False
+    origin = origin_host.lower()
+    host = target.host.lower()
+    return host == origin or host.endswith("." + origin)
 
 
 class RobotsChecker:
