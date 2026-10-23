@@ -66,3 +66,20 @@ def test_budget_warns_at_80_percent(redis, clock):
         guard.reserve(source)
     assert notes[-1] == ("warning", "來源 s 每日呼叫已達 80%")
     assert len([n for n in notes if n[0] == "warning"]) >= 1
+
+
+def test_interval_is_the_stricter_of_consecutive_callers(redis, clock):
+    limiter = RateLimiter(redis, clock)
+    limiter.acquire("shared.example.com", 1)
+    clock.advance(seconds=1)
+    # 要求 10 秒的呼叫者：從網域最後一次請求起算，不管上一次是誰發的
+    with pytest.raises(RateLimited) as exc:
+        limiter.acquire("shared.example.com", 10)
+    assert exc.value.retry_after_seconds == pytest.approx(9)
+    clock.advance(seconds=9)
+    limiter.acquire("shared.example.com", 10)
+    # 只要求 1 秒的呼叫者：仍要等滿上一位要求的 10 秒
+    clock.advance(seconds=5)
+    with pytest.raises(RateLimited) as exc:
+        limiter.acquire("shared.example.com", 1)
+    assert exc.value.retry_after_seconds == pytest.approx(5)

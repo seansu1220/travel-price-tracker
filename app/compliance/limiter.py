@@ -1,22 +1,31 @@
-"""限速器：同一網域兩次請求之間至少間隔 N 秒（Redis 原子操作，多工作者共用）。"""
+"""限速器：同一網域兩次請求之間至少間隔 N 秒（Redis 原子操作，多工作者共用）。
+
+間隔以「網域」全域計算，不分來源：多個來源共用同一網域時，任兩次相鄰請求的間隔
+必須同時滿足上一次與這一次請求者的設定，也就是取兩者中較長的那個。
+"""
 
 from redis import Redis
 
 from app.clock import Clock
 from app.compliance.errors import RateLimited
 
+# 鍵值存「上次請求時間|上次請求者要求的間隔」（毫秒）
 # 回傳 0 表示放行；否則回傳還要等幾毫秒
 _ACQUIRE = """
 local now = tonumber(ARGV[1])
 local interval = tonumber(ARGV[2])
 local last = redis.call('GET', KEYS[1])
 if last then
-  local elapsed = now - tonumber(last)
-  if elapsed < interval then
-    return interval - elapsed
+  local sep = string.find(last, '|', 1, true)
+  local last_at = tonumber(string.sub(last, 1, sep - 1))
+  local last_interval = tonumber(string.sub(last, sep + 1))
+  local required = math.max(interval, last_interval)
+  local elapsed = now - last_at
+  if elapsed < required then
+    return required - elapsed
   end
 end
-redis.call('SET', KEYS[1], ARGV[1], 'PX', interval * 2)
+redis.call('SET', KEYS[1], ARGV[1] .. '|' .. ARGV[2], 'PX', interval * 2)
 return 0
 """
 
