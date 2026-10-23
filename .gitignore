@@ -1,0 +1,32 @@
+# 環境變數與金鑰：絕不進版控
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+
+# 資料與備份
+*.sqlite3
+*.db
+backups/
+*.sql.gz
+
+# 系統與編輯器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
