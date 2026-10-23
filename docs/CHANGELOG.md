@@ -4,6 +4,34 @@
 
 ---
 
+## 2026-10-23　P0 收尾：robots.txt 轉址、網域全域限速、合併規則
+
+**問題描述**
+
+1. 擁有者決定：抓 robots.txt 時要依 RFC 9309 跟隨轉址，最多 5 次，只限同一個網域或其子網域。原本任何轉址都直接視為「無法確認」而拒絕。
+2. 擁有者要求確認限速以網域全域計算：兩個來源共用同一網域時，加起來仍要守每 10 秒 1 次。原本雖然以網域為鍵，但每個來源只檢查自己的間隔；若共用網域的兩個來源間隔設定不同，間隔較短的來源可以在嚴格來源請求後很快再請求。
+3. 合併規則改為 CI 通過才合併（從 P1 起）。
+
+**根本原因**
+
+1. P0 初版採保守做法，不跟隨 robots.txt 的轉址。
+2. Redis 只記錄上次請求時間，沒有記錄上次請求者要求的間隔。
+
+**修改的檔案與內容**
+
+| 檔案 | 內容 |
+| --- | --- |
+| `app/compliance/robots.py` | 新增純函式 `robots_redirect_allowed()`：只允許 http(s)，且目標是原網域本身或其子網域 |
+| `app/compliance/gate.py` | `_fetch_robots()` 逐跳跟隨轉址，每一跳都寫稽核日誌（`robots_fetch`）；轉到其他網域或超過次數時寫 `robots_redirect_denied` 並不放行；拆出 `_get_robots_once()`、`_record_robots_redirect_denied()` |
+| `app/config.py`、`.env.example` | 新增 `ROBOTS_MAX_REDIRECTS`（預設 5） |
+| `app/compliance/limiter.py` | Redis 改存「上次請求時間｜上次要求的間隔」，取相鄰兩次中較嚴格的間隔 |
+| `tests/test_gate.py` | 新增 12 項：http→https、子網域、相對路徑轉址、轉到其他網域／假冒網域／上層網域、5 次可以、6 次拒絕、沒有 Location 的轉址、共用網域取嚴格間隔 |
+| `tests/test_limiter_budget.py`、`tests/test_registry.py` | 新增限速器與轉址判斷函式的單元測試 |
+| `CLAUDE.md` | 「工作方式」新增第 6 條：CI 通過才合併 |
+| `PROGRESS.md` | 待確認全部定案，P1 待辦加入 CI 與 Telegram 告警要求 |
+
+---
+
 ## 2026-10-23　P0 依通用規則調整、待確認事項定案
 
 **問題描述**

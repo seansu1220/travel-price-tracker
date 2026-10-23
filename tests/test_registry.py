@@ -93,3 +93,16 @@ def test_limit_defaults_come_from_settings(monkeypatch):
         assert (reg.min_interval_seconds, reg.daily_call_limit) == (30, 120)
     finally:
         get_settings.cache_clear()
+
+
+def test_robots_redirect_allowed_rules():
+    import httpx
+
+    from app.compliance.robots import robots_redirect_allowed
+
+    assert robots_redirect_allowed("example.com", httpx.URL("https://example.com/robots.txt"))
+    assert robots_redirect_allowed("example.com", httpx.URL("https://www.example.com/robots.txt"))
+    assert robots_redirect_allowed("Example.com", httpx.URL("https://A.B.EXAMPLE.COM/robots.txt"))
+    assert not robots_redirect_allowed("www.example.com", httpx.URL("https://example.com/robots.txt"))
+    assert not robots_redirect_allowed("example.com", httpx.URL("https://evilexample.com/robots.txt"))
+    assert not robots_redirect_allowed("example.com", httpx.URL("https://example.com.evil.net/robots.txt"))

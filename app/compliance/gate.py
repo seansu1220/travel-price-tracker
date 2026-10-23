@@ -36,7 +36,7 @@ from app.compliance.errors import (
 )
 from app.compliance.limiter import RateLimiter
 from app.compliance.registry import pause_source, review_is_current
-from app.compliance.robots import RobotsChecker, RobotsFetchResult
+from app.compliance.robots import RobotsChecker, RobotsFetchResult, robots_redirect_allowed
 from app.config import Settings, get_settings
 from app.models import Source
 
@@ -263,23 +263,59 @@ class ComplianceGate:
         return verdict
 
     def _fetch_robots(self, source_id: str, robots_url: str) -> RobotsFetchResult:
-        """取得 robots.txt。這筆請求同樣寫入稽核日誌；不計入限速與預算（每網域每天約一次）。"""
+        """取得 robots.txt，不計入限速與預算（每網域每天約一次），但每一次請求都寫入稽核日誌。
+
+        依 RFC 9309 跟隨轉址，最多 ROBOTS_MAX_REDIRECTS 次，且只限原網域或其子網域；
+        否則回傳「無法確認」（status_code=None），閘門不放行。
+        """
+        origin_host = httpx.URL(robots_url).host
+        max_redirects = self._settings.robots_max_redirects
+        current_url = robots_url
+        for redirects_followed in range(max_redirects + 1):
+            response = self._get_robots_once(source_id, current_url)
+            if response is None:
+                return RobotsFetchResult(status_code=None)
+            # 沒有 Location 的 3xx 不跟隨，交給 RobotsChecker 判定為無法確認
+            if not (300 <= response.status_code < 400 and "location" in response.headers):
+                return RobotsFetchResult(status_code=response.status_code, body=_safe_text(response))
+            if redirects_followed == max_redirects:
+                break
+            target = httpx.URL(current_url).join(response.headers["location"])
+            if not robots_redirect_allowed(origin_host, target):
+                self._record_robots_redirect_denied(
+                    source_id, str(target), f"robots.txt 從 {current_url} 轉址到其他網域，不跟隨"
+                )
+                return RobotsFetchResult(status_code=None)
+            current_url = str(target)
+        self._record_robots_redirect_denied(
+            source_id, current_url, f"robots.txt 轉址超過 {max_redirects} 次（起點 {robots_url}），不再跟隨"
+        )
+        return RobotsFetchResult(status_code=None)
+
+    def _get_robots_once(self, source_id: str, url: str) -> httpx.Response | None:
+        """送出一次 robots.txt 請求並寫入稽核日誌；連線失敗回傳 None。"""
         started = time.monotonic()
         try:
-            response = self._client.get(robots_url)
+            response = self._client.get(url)
         except httpx.HTTPError as exc:
             self._audit.record(
-                source_id=source_id, method="GET", url=robots_url, decision="robots_fetch",
+                source_id=source_id, method="GET", url=url, decision="robots_fetch",
                 robots_verdict="not_applicable", created_at=self._clock(),
                 duration_ms=_elapsed_ms(started), detail=repr(exc),
             )
-            return RobotsFetchResult(status_code=None)
+            return None
         self._audit.record(
-            source_id=source_id, method="GET", url=robots_url, decision="robots_fetch",
+            source_id=source_id, method="GET", url=url, decision="robots_fetch",
             robots_verdict="not_applicable", created_at=self._clock(),
             status_code=response.status_code, duration_ms=_elapsed_ms(started),
         )
-        return RobotsFetchResult(status_code=response.status_code, body=_safe_text(response))
+        return response
+
+    def _record_robots_redirect_denied(self, source_id: str, url: str, reason: str) -> None:
+        self._audit.record(
+            source_id=source_id, method="GET", url=url, decision="robots_redirect_denied",
+            robots_verdict="unavailable", created_at=self._clock(), detail=reason,
+        )
 
     def _log(self, permit: Permit, decision: str, **fields) -> None:
         self._audit.record(

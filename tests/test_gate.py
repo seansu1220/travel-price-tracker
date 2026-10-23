@@ -439,3 +439,148 @@ def test_audit_write_failure_is_reported_with_context(gate, http, session_factor
             gate.request("unknown", "GET", FARES_URL)
     finally:
         FetchLogModel.__table__.create(session_factory.kw["bind"])
+
+
+# ---- robots.txt 轉址（RFC 9309）：最多 5 次，只限同網域或其子網域（擁有者 2026-10-23 決定） ----
+
+APEX_FARES = "https://example.com/fares/tpe-nrt"
+ROBOTS_BODY = fixture_text("robots/b_site.txt")
+
+
+def _redirect(location: str) -> httpx.Response:
+    return httpx.Response(301, headers={"location": location})
+
+
+def _apex_source(add_source):
+    add_source(id="apex", allowed_hosts=["example.com"], allowed_paths=["/fares/"])
+
+
+def _apex_page(http):
+    return http.get(APEX_FARES).mock(
+        return_value=httpx.Response(200, text="<p>TWD 4,560</p>", headers={"content-type": "text/html"})
+    )
+
+
+def test_robots_redirect_http_to_https_is_followed(gate, http, add_source, session_factory):
+    _apex_source(add_source)
+    http.get("http://example.com/robots.txt").mock(return_value=_redirect("https://example.com/robots.txt"))
+    http.get("https://example.com/robots.txt").mock(return_value=httpx.Response(200, text=ROBOTS_BODY))
+    page = http.get("http://example.com/fares/tpe-nrt").mock(
+        return_value=httpx.Response(200, text="ok", headers={"content-type": "text/plain"})
+    )
+    gate.request("apex", "GET", "http://example.com/fares/tpe-nrt")
+    assert page.called
+    robots_logs = [(log.url, log.status_code) for log in logs(session_factory) if log.decision == "robots_fetch"]
+    assert robots_logs == [("http://example.com/robots.txt", 301), ("https://example.com/robots.txt", 200)]
+
+
+def test_robots_redirect_to_subdomain_is_followed(gate, http, add_source):
+    _apex_source(add_source)
+    http.get("https://example.com/robots.txt").mock(return_value=_redirect("https://www.example.com/robots.txt"))
+    http.get("https://www.example.com/robots.txt").mock(return_value=httpx.Response(200, text=ROBOTS_BODY))
+    page = _apex_page(http)
+    gate.request("apex", "GET", APEX_FARES)
+    assert page.called
+
+
+def test_robots_redirect_rules_from_target_are_applied(gate, http, add_source):
+    _apex_source(add_source)
+    http.get("https://example.com/robots.txt").mock(return_value=_redirect("/robots/main.txt"))  # 相對路徑
+    http.get("https://example.com/robots/main.txt").mock(
+        return_value=httpx.Response(200, text=fixture_text("robots/deny_our_bot.txt"))
+    )
+    page = _apex_page(http)
+    with pytest.raises(errors.RobotsDisallowed):
+        gate.request("apex", "GET", APEX_FARES)
+    assert not page.called
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://other.net/robots.txt",  # 其他網域
+        "https://example.com.evil.net/robots.txt",  # 假冒網域
+        "https://notexample.com/robots.txt",  # 字尾相同但不是子網域
+        "ftp://example.com/robots.txt",  # 非 http(s)
+    ],
+)
+def test_robots_redirect_to_other_domain_is_denied(gate, http, add_source, session_factory, location):
+    _apex_source(add_source)
+    http.get("https://example.com/robots.txt").mock(return_value=_redirect(location))
+    elsewhere = http.route(url__regex=r"^(?!https://example\.com/robots\.txt).*robots\.txt$").mock(
+        return_value=httpx.Response(200, text="")
+    )
+    page = _apex_page(http)
+    with pytest.raises(errors.RobotsDisallowed) as exc:
+        gate.request("apex", "GET", APEX_FARES)
+    assert exc.value.verdict == "unavailable"
+    assert not elsewhere.called and not page.called
+    denied = [log for log in logs(session_factory) if log.decision == "robots_redirect_denied"]
+    assert len(denied) == 1 and "其他網域" in denied[0].detail
+
+
+def test_robots_redirect_to_parent_domain_is_denied(gate, http, add_source):
+    add_source(id="www", allowed_hosts=["www.example.com"], allowed_paths=["/fares/"])
+    http.get("https://www.example.com/robots.txt").mock(return_value=_redirect("https://example.com/robots.txt"))
+    apex_robots = http.get("https://example.com/robots.txt").mock(return_value=httpx.Response(200, text=""))
+    with pytest.raises(errors.RobotsDisallowed):
+        gate.request("www", "GET", "https://www.example.com/fares/x")
+    assert not apex_robots.called
+
+
+def _redirect_chain(http, hops: int):
+    """建立 hops 次轉址後回 200 的 robots.txt 鏈。"""
+    for index in range(hops):
+        current = "https://example.com/robots.txt" if index == 0 else f"https://example.com/r{index}.txt"
+        http.get(current).mock(return_value=_redirect(f"/r{index + 1}.txt"))
+    final = http.get(f"https://example.com/r{hops}.txt").mock(return_value=httpx.Response(200, text=ROBOTS_BODY))
+    return final
+
+
+def test_robots_follows_up_to_five_redirects(gate, http, add_source):
+    _apex_source(add_source)
+    final = _redirect_chain(http, 5)
+    page = _apex_page(http)
+    gate.request("apex", "GET", APEX_FARES)
+    assert final.called and page.called
+
+
+def test_robots_more_than_five_redirects_is_denied(gate, http, add_source, session_factory):
+    _apex_source(add_source)
+    final = _redirect_chain(http, 6)
+    page = _apex_page(http)
+    with pytest.raises(errors.RobotsDisallowed):
+        gate.request("apex", "GET", APEX_FARES)
+    assert not final.called and not page.called
+    entries = logs(session_factory)
+    assert [log.decision for log in entries].count("robots_fetch") == 6
+    assert "超過 5 次" in entries[-2].detail  # 最後一筆是閘門拒絕主請求的紀錄
+
+
+def test_robots_redirect_without_location_is_denied(gate, http, add_source):
+    _apex_source(add_source)
+    http.get("https://example.com/robots.txt").mock(return_value=httpx.Response(302))
+    page = _apex_page(http)
+    with pytest.raises(errors.RobotsDisallowed):
+        gate.request("apex", "GET", APEX_FARES)
+    assert not page.called
+
+
+# ---- 限速以網域全域計算（擁有者 2026-10-23 確認） ----
+
+
+def test_sources_sharing_a_domain_obey_the_stricter_interval(gate, http, add_source, clock):
+    add_source(id="strict", min_interval_seconds=10)
+    add_source(id="lenient", min_interval_seconds=1)
+    _, page = mock_b_site(http)
+    gate.request("strict", "GET", FARES_URL)
+    clock.advance(seconds=1)
+    with pytest.raises(errors.RateLimited) as exc:
+        gate.request("lenient", "GET", FARES_URL)  # 自己只要求 1 秒，但上一次是 10 秒的來源
+    assert exc.value.retry_after_seconds == pytest.approx(9)
+    clock.advance(seconds=9)
+    gate.request("lenient", "GET", FARES_URL)
+    clock.advance(seconds=1)
+    with pytest.raises(errors.RateLimited):
+        gate.request("strict", "GET", FARES_URL)  # 嚴格的來源仍要等滿自己的 10 秒
+    assert page.call_count == 2
